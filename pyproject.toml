@@ -1,0 +1,9 @@
+[project]
+name = "tg-keto-bot"
+version = "0.1.0"
+description = "Telegram keto-diet coach bot with recipe suggestions from Supabase"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
