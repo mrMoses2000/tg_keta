@@ -167,13 +167,12 @@ cmd_setup() {
     echo -e "${BOLD}🥑 КетоБот — Мастер первоначальной настройки${NC}"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    echo "Этот мастер поможет настроить всё необходимое:"
-    echo "  1. Проверка и установка зависимостей"
-    echo "  2. Настройка .env (токены, ключи)"
-    echo "  3. Запуск Docker-сервисов (Redis + Postgres)"
-    echo "  4. Применение миграций БД"
-    echo "  5. Настройка и установка Gemini CLI"
-    echo "  6. Регистрация Telegram вебхука"
+    echo "Порядок настройки:"
+    echo "  1. Скачать и установить ВСЕ зависимости"
+    echo "  2. Заполнить переменные окружения (.env)"
+    echo "  3. Запустить контейнеры (Redis + Postgres)"
+    echo "  4. Применить миграции БД"
+    echo "  5. Зарегистрировать Telegram вебхук"
     echo ""
 
     detect_os
@@ -183,28 +182,28 @@ cmd_setup() {
         return 0
     fi
 
-    # ── Step 1: Dependencies ──
-    log_step "Шаг 1/6: Проверка зависимостей"
-    setup_dependencies
+    # ── Step 1: Install ALL dependencies ──
+    log_step "Шаг 1/5: Скачивание и установка зависимостей"
+    echo "Проверяю и устанавливаю всё необходимое..."
+    echo ""
+    setup_install_all
 
-    # ── Step 2: .env Configuration ──
-    log_step "Шаг 2/6: Настройка .env"
+    # ── Step 2: Configure .env ──
+    log_step "Шаг 2/5: Настройка переменных окружения"
+    echo "Все программы установлены. Теперь заполним настройки."
+    echo ""
     setup_env_interactive
 
-    # ── Step 3: Docker Services ──
-    log_step "Шаг 3/6: Docker-сервисы (Redis + Postgres)"
+    # ── Step 3: Start Docker containers ──
+    log_step "Шаг 3/5: Запуск контейнеров (Redis + Postgres)"
     setup_docker
 
-    # ── Step 4: Migrations ──
-    log_step "Шаг 4/6: Миграции базы данных"
+    # ── Step 4: Apply migrations ──
+    log_step "Шаг 4/5: Миграции базы данных"
     setup_migrations
 
-    # ── Step 5: Gemini CLI ──
-    log_step "Шаг 5/6: Gemini CLI"
-    setup_gemini
-
-    # ── Step 6: Webhook ──
-    log_step "Шаг 6/6: Telegram вебхук"
+    # ── Step 5: Register webhook ──
+    log_step "Шаг 5/5: Регистрация Telegram вебхука"
     setup_webhook_interactive
 
     # ── Summary ──
@@ -220,12 +219,15 @@ cmd_setup() {
     echo ""
 }
 
-# ─── Step 1: Dependencies ────────────────────────────────────
+# ─── Step 1: Install ALL dependencies ────────────────────────
+# Order: system packages → Docker → Node.js → Python venv → Gemini CLI → ngrok
+# NOTHING is started here — only downloaded and installed.
 
-setup_dependencies() {
-    local missing=()
+setup_install_all() {
+    echo -e "${BOLD}1.1 Системные пакеты${NC}"
+    echo ""
 
-    # Python 3.10+
+    # ── Python 3.10+ ──
     if command -v python3 &>/dev/null; then
         PY_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
         PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
@@ -233,101 +235,237 @@ setup_dependencies() {
             log_ok "Python $PY_VERSION"
         else
             log_err "Python $PY_VERSION — нужен >= 3.10"
-            missing+=("python3")
+            if prompt_yn "Попробовать установить Python 3.12?"; then
+                if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                    install_package python@3.12 "Python 3.12" || true
+                else
+                    sudo apt-get update -qq && sudo apt-get install -y -qq python3 python3-pip python3-venv || true
+                fi
+            fi
         fi
     else
         log_err "Python3 не найден"
-        missing+=("python3")
+        if prompt_yn "Установить Python?"; then
+            if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                install_package python@3.12 "Python 3.12" || true
+            else
+                sudo apt-get update -qq && sudo apt-get install -y -qq python3 python3-pip python3-venv || true
+            fi
+        fi
     fi
 
-    # pip
+    # ── pip ──
     if python3 -m pip --version &>/dev/null 2>&1; then
         log_ok "pip"
     else
         log_warn "pip не найден"
-        missing+=("python3-pip")
+        if prompt_yn "Установить pip?"; then
+            if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                python3 -m ensurepip 2>/dev/null || install_package python@3.12 "Python + pip" || true
+            else
+                sudo apt-get install -y -qq python3-pip 2>/dev/null || true
+            fi
+        fi
     fi
 
-    # Docker
-    if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
-        log_ok "Docker"
-    else
-        log_warn "Docker не найден / не запущен"
-        missing+=("docker")
-    fi
-
-    # psql
+    # ── psql (PostgreSQL client) ──
     if command -v psql &>/dev/null; then
         log_ok "psql"
     else
         log_warn "psql не найден (нужен для миграций)"
-        missing+=("postgresql-client")
+        if prompt_yn "Установить postgresql-client?"; then
+            if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                install_package libpq "PostgreSQL client" || true
+            else
+                sudo apt-get install -y -qq postgresql-client || true
+            fi
+        fi
     fi
 
-    # Node.js (for Gemini CLI)
+    # ── Docker ──
+    echo ""
+    echo -e "${BOLD}1.2 Docker${NC}"
+    echo ""
+
+    if command -v docker &>/dev/null; then
+        if docker info &>/dev/null 2>&1; then
+            log_ok "Docker работает"
+        else
+            log_warn "Docker установлен, но не запущен"
+            echo "  Запустите Docker Desktop или сервис docker:"
+            if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                echo "    open -a Docker"
+            else
+                echo "    sudo systemctl start docker"
+            fi
+            if prompt_yn "Попробовать запустить Docker сейчас?"; then
+                if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                    open -a Docker 2>/dev/null || true
+                    echo "  Подождите, пока Docker Desktop запустится..."
+                    sleep 10
+                else
+                    sudo systemctl start docker 2>/dev/null || true
+                fi
+            fi
+        fi
+    else
+        log_warn "Docker не установлен"
+        echo "  Docker нужен для Redis и PostgreSQL."
+        echo ""
+        if [[ "$OS_KERNEL" == "Darwin" ]]; then
+            echo "  Варианты установки:"
+            echo "    1. Docker Desktop: https://docs.docker.com/desktop/install/mac-install/"
+            echo "    2. brew install --cask docker"
+            echo ""
+            if prompt_yn "Установить через brew?"; then
+                brew install --cask docker 2>/dev/null || true
+                echo "  Запустите Docker Desktop после установки."
+            fi
+        else
+            echo "  Варианты установки:"
+            echo "    1. Официальный скрипт: curl -fsSL https://get.docker.com | sh"
+            echo "    2. apt: sudo apt install docker.io docker-compose-plugin"
+            echo ""
+            if prompt_yn "Установить через официальный скрипт?"; then
+                curl -fsSL https://get.docker.com | sh
+                sudo usermod -aG docker "$USER" 2>/dev/null || true
+                sudo systemctl start docker 2>/dev/null || true
+                log_ok "Docker установлен"
+                log_warn "Может потребоваться перелогиниться для группы docker"
+            fi
+        fi
+    fi
+
+    # docker compose
+    if docker compose version &>/dev/null 2>&1; then
+        log_ok "docker compose"
+    elif command -v docker-compose &>/dev/null; then
+        log_ok "docker-compose (v1)"
+    else
+        log_warn "docker compose не найден"
+        if [[ "$OS_KERNEL" == "Linux" ]] && command -v apt-get &>/dev/null; then
+            if prompt_yn "Установить docker-compose-plugin?"; then
+                sudo apt-get install -y -qq docker-compose-plugin 2>/dev/null || true
+            fi
+        fi
+    fi
+
+    # ── Node.js ──
+    echo ""
+    echo -e "${BOLD}1.3 Node.js (для Gemini CLI)${NC}"
+    echo ""
+
     if command -v node &>/dev/null; then
         log_ok "Node.js $(node --version)"
     else
         log_warn "Node.js не найден (нужен для Gemini CLI)"
-        missing+=("nodejs")
-    fi
-
-    # Install missing
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        echo ""
-        log_warn "Не хватает: ${missing[*]}"
-        if prompt_yn "Попробовать установить автоматически?"; then
-            for pkg in "${missing[@]}"; do
-                case "$pkg" in
-                    docker)
-                        echo ""
-                        log_info "Docker лучше установить вручную:"
-                        if [[ "$OS_KERNEL" == "Darwin" ]]; then
-                            echo "  → https://docs.docker.com/desktop/install/mac-install/"
-                            echo "  или: brew install --cask docker"
-                        else
-                            echo "  → https://docs.docker.com/engine/install/ubuntu/"
-                            echo "  или: curl -fsSL https://get.docker.com | sh"
-                            if prompt_yn "Выполнить curl -fsSL https://get.docker.com | sh ?"; then
-                                curl -fsSL https://get.docker.com | sh
-                                sudo usermod -aG docker "$USER" 2>/dev/null || true
-                                log_ok "Docker установлен (может потребоваться перелогиниться)"
-                            fi
-                        fi
-                        ;;
-                    nodejs)
-                        if [[ "$OS_KERNEL" == "Darwin" ]]; then
-                            install_package node "Node.js" || true
-                        else
-                            log_info "Устанавливаю Node.js 20 LTS..."
-                            if command -v apt-get &>/dev/null; then
-                                curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null
-                                sudo apt-get install -y -qq nodejs 2>/dev/null || true
-                            fi
-                        fi
-                        ;;
-                    *)
-                        install_package "$pkg" "$pkg" || true
-                        ;;
-                esac
-            done
+        if prompt_yn "Установить Node.js 20 LTS?"; then
+            if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                install_package node "Node.js" || true
+            else
+                log_info "Скачиваю и устанавливаю Node.js 20 LTS..."
+                curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - 2>/dev/null || true
+                sudo apt-get install -y -qq nodejs 2>/dev/null || true
+            fi
+            if command -v node &>/dev/null; then
+                log_ok "Node.js $(node --version) установлен"
+            fi
         fi
-    else
-        log_ok "Все зависимости на месте"
     fi
 
-    # Python venv + pip install
+    # ── Gemini CLI ──
     echo ""
+    echo -e "${BOLD}1.4 Gemini CLI (LLM)${NC}"
+    echo ""
+
+    if command -v gemini &>/dev/null; then
+        log_ok "Gemini CLI уже установлен"
+    else
+        echo "  Gemini CLI — инструмент для вызова Google Gemini AI."
+        echo "  Бот использует его для генерации ответов пользователям."
+        echo ""
+
+        if command -v npm &>/dev/null; then
+            if prompt_yn "Установить Gemini CLI через npm?" "y"; then
+                log_info "Устанавливаю @google/gemini-cli..."
+                npm install -g @google/gemini-cli 2>/dev/null || {
+                    log_warn "npm install не сработал"
+                    echo "  Попробуйте вручную: sudo npm install -g @google/gemini-cli"
+                }
+                if command -v gemini &>/dev/null; then
+                    log_ok "Gemini CLI установлен"
+                fi
+            fi
+        else
+            log_warn "npm не найден — установите Node.js сначала (см. выше)"
+        fi
+
+        # Auth
+        if command -v gemini &>/dev/null; then
+            echo ""
+            echo -e "${YELLOW}Gemini CLI требует авторизации Google.${NC}"
+            echo "  При первом запуске gemini попросит войти в Google аккаунт."
+            echo ""
+            if prompt_yn "Запустить gemini сейчас для авторизации?"; then
+                gemini || true
+            else
+                log_info "Авторизуйтесь позже: запустите 'gemini' в терминале"
+            fi
+        fi
+    fi
+
+    # ── ngrok ──
+    echo ""
+    echo -e "${BOLD}1.5 ngrok (туннель для dev-режима)${NC}"
+    echo ""
+
+    if command -v ngrok &>/dev/null; then
+        log_ok "ngrok уже установлен"
+    else
+        echo "  ngrok создаёт публичный HTTPS-туннель к вашему localhost."
+        echo "  Нужен для тестирования бота без домена."
+        echo ""
+        if prompt_yn "Установить ngrok?"; then
+            if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                brew install ngrok 2>/dev/null || true
+            else
+                if command -v snap &>/dev/null; then
+                    sudo snap install ngrok 2>/dev/null || true
+                else
+                    log_info "Скачиваю ngrok..."
+                    curl -fsSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar xz -C /usr/local/bin 2>/dev/null || true
+                fi
+            fi
+            if command -v ngrok &>/dev/null; then
+                log_ok "ngrok установлен"
+            else
+                log_warn "Не удалось установить. Скачайте вручную: https://ngrok.com/download"
+            fi
+        fi
+    fi
+
+    # ── Python venv + pip install ──
+    echo ""
+    echo -e "${BOLD}1.6 Python-зависимости проекта${NC}"
+    echo ""
+
     if [[ ! -d ".venv" ]]; then
-        log_info "Создаю Python вirtualenv..."
+        log_info "Создаю Python virtualenv..."
         python3 -m venv .venv
     fi
     # shellcheck source=/dev/null
     source .venv/bin/activate
-    log_info "Устанавливаю Python-зависимости..."
+    log_info "Устанавливаю Python-зависимости (pip install -r requirements.txt)..."
     pip install -q -r requirements.txt
     log_ok "Python-зависимости установлены"
+
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_ok "Все программы установлены. Переходим к настройке."
 }
+
+# Alias for backward compatibility
+setup_dependencies() { setup_install_all; }
 
 # ─── Step 2: .env Interactive ────────────────────────────────
 
@@ -411,6 +549,22 @@ setup_env_interactive() {
     prompt_with_default "Порт вебхук-сервера" "8080" WH_PORT
     set_env_var "WEBHOOK_PORT" "$WH_PORT"
 
+    # ── LLM CLI command ──
+    echo ""
+    echo "Какой LLM CLI использовать?"
+    echo "  gemini — Google Gemini (по умолчанию)"
+    echo "  Можно указать любую другую команду"
+    echo ""
+    prompt_with_default "Команда LLM CLI" "gemini" LLM_CMD
+    set_env_var "LLM_CLI_COMMAND" "$LLM_CMD"
+
+    prompt_with_default "Флаги перед промптом" "-p" LLM_FLAGS
+    set_env_var "LLM_CLI_FLAGS" "$LLM_FLAGS"
+
+    # ── Concurrency ──
+    prompt_with_default "Макс. параллельных LLM-запросов" "1" LLM_CONC
+    set_env_var "MAX_LLM_CONCURRENCY" "$LLM_CONC"
+
     echo ""
     log_ok "Файл .env настроен"
 }
@@ -449,64 +603,7 @@ setup_migrations() {
     }
 }
 
-# ─── Step 5: Gemini CLI ─────────────────────────────────────
-
-setup_gemini() {
-    if command -v gemini &>/dev/null; then
-        log_ok "Gemini CLI уже установлен"
-        gemini --version 2>/dev/null || true
-        return 0
-    fi
-
-    echo -e "${YELLOW}Gemini CLI не найден в PATH.${NC}"
-    echo ""
-    echo "Gemini CLI — это инструмент для вызова Google Gemini из командной строки."
-    echo "Бот использует его для генерации ответов."
-    echo ""
-
-    if ! command -v npm &>/dev/null && ! command -v npx &>/dev/null; then
-        log_warn "npm/npx не найден — установите Node.js сначала"
-        echo "  macOS:  brew install node"
-        echo "  Ubuntu: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs"
-        return 0
-    fi
-
-    if prompt_yn "Установить Gemini CLI через npm?" "y"; then
-        log_info "Устанавливаю @anthropic-ai/claude-code... (это может занять минуту)"
-        npm install -g @google/gemini-cli 2>/dev/null || {
-            log_warn "npm install не сработал, попробуйте вручную:"
-            echo "  npm install -g @google/gemini-cli"
-        }
-
-        if command -v gemini &>/dev/null; then
-            log_ok "Gemini CLI установлен"
-            echo ""
-            echo -e "${YELLOW}Нужна авторизация Gemini:${NC}"
-            echo "  Запустите: gemini"
-            echo "  Следуйте инструкциям для логина в Google"
-            echo ""
-            if prompt_yn "Запустить gemini сейчас для авторизации?"; then
-                gemini || true
-            fi
-        fi
-    else
-        log_info "Пропущено. Установите позже:"
-        echo "  npm install -g @google/gemini-cli"
-        echo "  gemini  # для авторизации"
-    fi
-
-    # Ask which LLM to use
-    echo ""
-    echo "Какой LLM CLI использовать?"
-    echo "  1) gemini  — Google Gemini (по умолчанию)"
-    echo "  2) другой  — указать вручную"
-    echo ""
-    prompt_with_default "Команда LLM CLI" "gemini" LLM_CMD
-    set_env_var "LLM_CLI_COMMAND" "$LLM_CMD"
-
-    prompt_with_default "Флаги LLM CLI (перед промптом)" "-p" LLM_FLAGS
-    set_env_var "LLM_CLI_FLAGS" "$LLM_FLAGS"
-}
+# setup_gemini is now integrated into setup_install_all (step 1.4)
 
 # ─── Step 6: Webhook Registration ────────────────────────────
 
