@@ -400,17 +400,12 @@ setup_install_all() {
             log_warn "npm не найден — установите Node.js сначала (см. выше)"
         fi
 
-        # Auth
+        # Auth reminder (manual step)
         if command -v gemini &>/dev/null; then
             echo ""
-            echo -e "${YELLOW}Gemini CLI требует авторизации Google.${NC}"
-            echo "  При первом запуске gemini попросит войти в Google аккаунт."
-            echo ""
-            if prompt_yn "Запустить gemini сейчас для авторизации?"; then
-                gemini || true
-            else
-                log_info "Авторизуйтесь позже: запустите 'gemini' в терминале"
-            fi
+            log_info "Gemini CLI установлен, но требует ручной авторизации."
+            echo "  Запустите в терминале:  gemini"
+            echo "  Следуйте инструкциям для логина в Google аккаунт."
         fi
     fi
 
