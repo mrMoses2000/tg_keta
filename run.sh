@@ -138,14 +138,94 @@ start_managed_process() {
 }
 
 ensure_venv_ready() {
-    if [[ ! -d ".venv" ]]; then
-        log_info "Создаю Python virtualenv..."
-        python3 -m venv .venv
+    if [[ -z "${OS_KERNEL:-}" ]]; then
+        detect_os
     fi
+
+    if [[ ! -d ".venv" ]]; then
+        ensure_python_venv_support
+        log_info "Создаю Python virtualenv..."
+        if ! python3 -m venv .venv; then
+            log_warn "Не удалось создать virtualenv с первого раза"
+            if prompt_yn "Попробовать доустановить python3-venv и повторить?" "y"; then
+                install_python_venv_support || {
+                    log_err "Не удалось установить пакет python3-venv"
+                    return 1
+                }
+                python3 -m venv .venv || {
+                    log_err "Создать .venv не удалось даже после установки python3-venv"
+                    return 1
+                }
+            else
+                return 1
+            fi
+        fi
+    fi
+
     # shellcheck source=/dev/null
     source .venv/bin/activate
+    if ! python -m pip --version &>/dev/null; then
+        log_warn "pip внутри .venv не найден, пробую восстановить через ensurepip..."
+        python -m ensurepip --upgrade || {
+            log_err "Не удалось восстановить pip в .venv"
+            return 1
+        }
+    fi
+
     log_info "Устанавливаю Python-зависимости (pip install -r requirements.txt)..."
-    pip install -q -r requirements.txt
+    python -m pip install -q -r requirements.txt
+}
+
+install_python_venv_support() {
+    if [[ -z "${OS_KERNEL:-}" ]]; then
+        detect_os
+    fi
+
+    if [[ "$OS_KERNEL" == "Darwin" ]]; then
+        # Homebrew python usually includes venv support.
+        return 0
+    fi
+
+    if [[ "$OS_KERNEL" == "Linux" ]] && command -v apt-get &>/dev/null; then
+        local version_pkg
+        version_pkg="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}-venv")' 2>/dev/null || true)"
+        log_info "Устанавливаю поддержку venv через apt..."
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq python3-venv && return 0
+        [[ -n "$version_pkg" ]] && sudo apt-get install -y -qq "$version_pkg" && return 0
+        return 1
+    fi
+
+    if [[ "$OS_KERNEL" == "Linux" ]] && command -v dnf &>/dev/null; then
+        log_info "Устанавливаю поддержку venv через dnf..."
+        sudo dnf install -y python3-venv || sudo dnf install -y python3
+        return $?
+    fi
+
+    return 1
+}
+
+ensure_python_venv_support() {
+    if python3 -m ensurepip --version &>/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_warn "Модуль ensurepip недоступен (обычно отсутствует python3-venv)"
+    if prompt_yn "Установить пакет поддержки virtualenv сейчас?" "y"; then
+        install_python_venv_support || {
+            log_err "Не удалось установить пакеты для virtualenv"
+            return 1
+        }
+        if python3 -m ensurepip --version &>/dev/null 2>&1; then
+            log_ok "Поддержка virtualenv установлена"
+            return 0
+        fi
+        log_err "ensurepip всё ещё недоступен после установки"
+        return 1
+    fi
+
+    log_err "Без virtualenv (python3-venv) запуск проекта невозможен"
+    return 1
 }
 
 get_ngrok_public_url() {
