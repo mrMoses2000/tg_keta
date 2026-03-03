@@ -142,7 +142,12 @@ ensure_venv_ready() {
         detect_os
     fi
 
-    if [[ ! -d ".venv" ]]; then
+    if [[ ! -d ".venv" || ! -f ".venv/bin/activate" ]]; then
+        if [[ -d ".venv" ]]; then
+            log_warn "Обнаружен неполный virtualenv (.venv без bin/activate), пересоздаю..."
+            rm -rf .venv
+        fi
+
         ensure_python_venv_support
         log_info "Создаю Python virtualenv..."
         if ! python3 -m venv .venv; then
@@ -163,6 +168,10 @@ ensure_venv_ready() {
     fi
 
     # shellcheck source=/dev/null
+    if [[ ! -f ".venv/bin/activate" ]]; then
+        log_err "virtualenv создан некорректно: отсутствует .venv/bin/activate"
+        return 1
+    fi
     source .venv/bin/activate
     if ! python -m pip --version &>/dev/null; then
         log_warn "pip внутри .venv не найден, пробую восстановить через ensurepip..."
