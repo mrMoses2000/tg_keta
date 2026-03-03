@@ -59,3 +59,21 @@ class TestParseActions:
     def test_empty_input(self):
         result = parse_actions("")
         assert len(result.reply_text) > 0
+
+    def test_salvages_reply_when_actions_are_partially_invalid(self):
+        raw = """
+        {
+          "reply_text": "Понял, учту аллергию на цитрусовые.",
+          "actions": {
+            "profile_patch": {"allergies_detail": "аллергия на цитрусовые"},
+            "state_patch": {"mode": "onboarding", "step": "ask_lactose"}
+          }
+        }
+        """
+        result = parse_actions(raw)
+        assert "аллерги" in result.reply_text.lower()
+        assert result.actions is not None
+        assert result.actions.profile_patch is not None
+        assert isinstance(result.actions.profile_patch.allergies_detail, list)
+        assert result.actions.state_patch is not None
+        assert result.actions.state_patch.step is None

@@ -20,6 +20,7 @@ import json
 import re
 
 import structlog
+from pydantic import ValidationError
 
 from src.models import ActionsJson, Actions, SafetyFlags
 
@@ -49,16 +50,25 @@ def parse_actions(raw_output: str) -> ActionsJson:
 
         data = json.loads(json_str)
 
-        # Validate with Pydantic
-        result = ActionsJson.model_validate(data)
-        logger.info("actions_parsed_ok", has_profile_patch=bool(result.actions and result.actions.profile_patch))
-        return result
+        try:
+            # Validate with Pydantic
+            result = ActionsJson.model_validate(data)
+            logger.info("actions_parsed_ok", has_profile_patch=bool(result.actions and result.actions.profile_patch))
+            return result
+        except ValidationError as e:
+            # Try to salvage usable reply_text and sanitize common action format errors.
+            logger.warning("actions_validation_error", error=str(e), output_preview=raw_output[:200])
+            salvaged = _salvage_actions(data)
+            if salvaged is not None:
+                logger.info("actions_salvaged_after_validation_error")
+                return salvaged
+            return _fallback(raw_output)
 
     except json.JSONDecodeError as e:
         logger.warning("actions_json_decode_error", error=str(e), output_preview=raw_output[:200])
         return _fallback(raw_output)
     except Exception as e:
-        logger.warning("actions_validation_error", error=str(e), output_preview=raw_output[:200])
+        logger.warning("actions_unexpected_parse_error", error=str(e), output_preview=raw_output[:200])
         return _fallback(raw_output)
 
 
@@ -109,3 +119,64 @@ def _fallback(raw_output: str) -> ActionsJson:
             safety_flags=SafetyFlags(),
         ),
     )
+
+
+def _salvage_actions(data: dict) -> ActionsJson | None:
+    """
+    Best-effort sanitizer for partially invalid JSON actions.
+
+    We preserve reply_text when possible and drop/normalize only invalid action fields.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    reply_text = data.get("reply_text")
+    if not isinstance(reply_text, str) or not reply_text.strip():
+        reply_text = FALLBACK_REPLY
+    reply_text = reply_text.strip()[:4000]
+
+    actions_raw = data.get("actions")
+    if not isinstance(actions_raw, dict):
+        return ActionsJson(reply_text=reply_text, actions=None)
+
+    sanitized_actions = dict(actions_raw)
+
+    # profile_patch normalization
+    profile_patch = sanitized_actions.get("profile_patch")
+    if isinstance(profile_patch, dict):
+        pp = dict(profile_patch)
+        allergies = pp.get("allergies_detail")
+        if isinstance(allergies, str):
+            pp["allergies_detail"] = [{"allergen": allergies, "severity": "unspecified"}]
+        elif isinstance(allergies, list):
+            normalized_allergies = []
+            for item in allergies:
+                if isinstance(item, str):
+                    normalized_allergies.append({"allergen": item, "severity": "unspecified"})
+                elif isinstance(item, dict):
+                    normalized_allergies.append(item)
+            pp["allergies_detail"] = normalized_allergies
+        sanitized_actions["profile_patch"] = pp
+
+    # state_patch normalization: unknown step values are ignored
+    state_patch = sanitized_actions.get("state_patch")
+    allowed_steps = {
+        "ask_restrictions",
+        "ask_taste",
+        "ask_goals",
+        "showing_results",
+        "explaining",
+        "suggesting_alternative",
+        None,
+    }
+    if isinstance(state_patch, dict):
+        sp = dict(state_patch)
+        if sp.get("step") not in allowed_steps:
+            sp["step"] = None
+        sanitized_actions["state_patch"] = sp
+
+    try:
+        return ActionsJson.model_validate({"reply_text": reply_text, "actions": sanitized_actions})
+    except ValidationError:
+        # Last-resort: keep only user-facing text.
+        return ActionsJson(reply_text=reply_text, actions=None)
