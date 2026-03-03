@@ -67,18 +67,18 @@ def update_last_messages(
     Append user + assistant messages to the bounded ring buffer.
     Keeps only the last `max_messages` entries.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     messages = list(state.last_messages)  # copy
     messages.append({
         "role": "user",
         "content": user_message,
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
     })
     messages.append({
         "role": "assistant",
         "content": assistant_reply[:500],  # truncate assistant reply for storage
-        "ts": datetime.utcnow().isoformat(),
+        "ts": datetime.now(timezone.utc).isoformat(),
     })
 
     # Keep only last N

@@ -15,7 +15,7 @@ Design notes:
 from __future__ import annotations
 
 import enum
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Literal
 from uuid import UUID
 
@@ -99,7 +99,7 @@ class Job(BaseModel):
     user_id: int
     text: str
     raw_update: dict[str, Any]
-    received_at: datetime = Field(default_factory=datetime.utcnow)
+    received_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     attempt: int = 0
 
 
@@ -250,13 +250,21 @@ class Recipe(BaseModel):
     def _parse_ingredients(cls, v: Any) -> list[dict]:
         """Handle JSONB array from Supabase."""
         if isinstance(v, list):
-            return v
+            normalized: list[dict] = []
+            for item in v:
+                if isinstance(item, RecipeIngredient):
+                    normalized.append(item.model_dump())
+                elif isinstance(item, dict):
+                    normalized.append(item)
+            return normalized
         return []
 
     @field_validator("macros", mode="before")
     @classmethod
     def _parse_macros(cls, v: Any) -> dict:
         """Handle JSONB object from Supabase."""
+        if isinstance(v, RecipeMacros):
+            return v.model_dump()
         if isinstance(v, dict):
             return v
         return {}

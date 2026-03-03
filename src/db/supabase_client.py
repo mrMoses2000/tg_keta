@@ -19,6 +19,8 @@ which uses RPC functions for ingredient exclusion filtering.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from supabase import create_client, Client
 import structlog
 
@@ -115,7 +117,7 @@ def search_recipes(
         )
         if len(trimmed) >= 3:
             # FTS via textSearch — uses GIN index idx_recipes_fts
-            q = q.text_search("title", trimmed, config="russian")
+            q = q.text_search("title", trimmed, {"config": "russian"})
         else:
             q = q.ilike("title", f"%{trimmed}%")
 
@@ -206,7 +208,7 @@ def update_user_profile(user_id: str, patch: dict) -> None:
     if not safe_patch:
         return
 
-    safe_patch["updated_at"] = "now()"
+    safe_patch["updated_at"] = datetime.now(timezone.utc).isoformat()
     client.table("users").update(safe_patch).eq("id", user_id).execute()
     logger.info("user_profile_updated", user_id=user_id, fields=list(safe_patch.keys()))
 

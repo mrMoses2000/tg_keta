@@ -10,6 +10,7 @@
 #   ./run.sh up         - Start services (Docker + bot processes)
 #   ./run.sh down       - Stop services
 #   ./run.sh webhook    - Register/update Telegram webhook
+#   ./run.sh tunnel     - Manage ngrok tunnel (up/down/status/url)
 #   ./run.sh logs       - Tail logs
 #   ./run.sh migrate    - Apply local Postgres migrations
 #   ./run.sh test       - Run tests (unit/integration/e2e/smoke)
@@ -39,6 +40,156 @@ log_warn() { echo -e "${YELLOW}⚠${NC} $1"; }
 log_err()  { echo -e "${RED}✗${NC} $1"; }
 log_info() { echo -e "${BLUE}ℹ${NC} $1"; }
 log_step() { echo -e "\n${CYAN}${BOLD}── $1 ──${NC}\n"; }
+
+APP_LOG_DIR="${SCRIPT_DIR}/.logs"
+WEBHOOK_LOG_FILE="${APP_LOG_DIR}/webhook.log"
+WORKER_LOG_FILE="${APP_LOG_DIR}/worker.log"
+NGROK_LOG_FILE="${APP_LOG_DIR}/ngrok.log"
+NGROK_PID_FILE="${SCRIPT_DIR}/.ngrok.pid"
+NGROK_PUBLIC_URL=""
+
+load_env() {
+    if [[ -f .env ]]; then
+        # shellcheck source=/dev/null
+        set -a; source .env 2>/dev/null; set +a
+    fi
+}
+
+docker_compose() {
+    if docker compose version &>/dev/null 2>&1; then
+        docker compose "$@"
+    elif command -v docker-compose &>/dev/null; then
+        docker-compose "$@"
+    else
+        return 127
+    fi
+}
+
+stop_pidfile_process() {
+    local pidfile="$1"
+    local name="$2"
+
+    if [[ ! -f "$pidfile" ]]; then
+        return 0
+    fi
+
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -z "$pid" ]]; then
+        rm -f "$pidfile"
+        return 0
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        for _ in {1..10}; do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                break
+            fi
+            sleep 1
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            log_warn "$name не завершился по SIGTERM, отправляю SIGKILL"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+        log_ok "$name остановлен (PID: $pid)"
+    fi
+
+    rm -f "$pidfile"
+}
+
+start_managed_process() {
+    local name="$1"
+    local pidfile="$2"
+    local logfile="$3"
+    shift 3
+
+    mkdir -p "$APP_LOG_DIR"
+    touch "$logfile"
+
+    if [[ -f "$pidfile" ]]; then
+        local existing_pid
+        existing_pid="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+            if prompt_yn "$name уже запущен (PID: $existing_pid). Перезапустить?" "n"; then
+                stop_pidfile_process "$pidfile" "$name"
+            else
+                log_info "$name оставлен запущенным"
+                return 0
+            fi
+        else
+            rm -f "$pidfile"
+        fi
+    fi
+
+    log_info "Запускаю $name..."
+    nohup "$@" >> "$logfile" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pidfile"
+    sleep 1
+
+    if kill -0 "$pid" 2>/dev/null; then
+        log_ok "$name запущен (PID: $pid)"
+        return 0
+    fi
+
+    log_err "Не удалось запустить $name. Проверьте лог: $logfile"
+    return 1
+}
+
+ensure_venv_ready() {
+    if [[ ! -d ".venv" ]]; then
+        log_info "Создаю Python virtualenv..."
+        python3 -m venv .venv
+    fi
+    # shellcheck source=/dev/null
+    source .venv/bin/activate
+    log_info "Устанавливаю Python-зависимости (pip install -r requirements.txt)..."
+    pip install -q -r requirements.txt
+}
+
+get_ngrok_public_url() {
+    local url=""
+    url="$(curl -sf http://127.0.0.1:4040/api/tunnels 2>/dev/null | \
+        python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((t.get("public_url","") for t in d.get("tunnels",[]) if t.get("proto")=="https"), ""))' 2>/dev/null || true)"
+    echo "$url"
+}
+
+start_ngrok_tunnel() {
+    load_env
+    local port="${WEBHOOK_PORT:-8080}"
+
+    if ! command -v ngrok &>/dev/null; then
+        log_err "ngrok не найден. Установите через ./run.sh install или вручную"
+        return 1
+    fi
+
+    if ! start_managed_process "ngrok" "$NGROK_PID_FILE" "$NGROK_LOG_FILE" ngrok http "$port"; then
+        return 1
+    fi
+
+    local retries=15
+    local url=""
+    while [[ $retries -gt 0 ]]; do
+        url="$(get_ngrok_public_url)"
+        if [[ -n "$url" ]]; then
+            NGROK_PUBLIC_URL="$url"
+            set_env_var "WEBHOOK_MODE" "ngrok"
+            set_env_var "WEBHOOK_DOMAIN" "$url"
+            log_ok "ngrok tunnel поднят: $url"
+            return 0
+        fi
+        retries=$((retries - 1))
+        sleep 1
+    done
+
+    log_err "ngrok запущен, но URL не получен. Проверьте: $NGROK_LOG_FILE"
+    return 1
+}
+
+stop_ngrok_tunnel() {
+    stop_pidfile_process "$NGROK_PID_FILE" "ngrok"
+}
 
 # Helper: prompt with a default value
 prompt_with_default() {
@@ -135,6 +286,10 @@ detect_os() {
 install_package() {
     local pkg="$1"
     local desc="${2:-$pkg}"
+
+    if [[ -z "${OS_KERNEL:-}" ]]; then
+        detect_os
+    fi
 
     if [[ "$OS_KERNEL" == "Darwin" ]]; then
         if command -v brew &>/dev/null; then
@@ -428,7 +583,11 @@ setup_install_all() {
                     sudo snap install ngrok 2>/dev/null || true
                 else
                     log_info "Скачиваю ngrok..."
-                    curl -fsSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar xz -C /usr/local/bin 2>/dev/null || true
+                    local ngrok_arch="amd64"
+                    if [[ "${OS_ARCH:-}" == "aarch64" || "${OS_ARCH:-}" == "arm64" ]]; then
+                        ngrok_arch="arm64"
+                    fi
+                    curl -fsSL "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-${ngrok_arch}.tgz" | sudo tar xz -C /usr/local/bin 2>/dev/null || true
                 fi
             fi
             if command -v ngrok &>/dev/null; then
@@ -444,14 +603,7 @@ setup_install_all() {
     echo -e "${BOLD}1.6 Python-зависимости проекта${NC}"
     echo ""
 
-    if [[ ! -d ".venv" ]]; then
-        log_info "Создаю Python virtualenv..."
-        python3 -m venv .venv
-    fi
-    # shellcheck source=/dev/null
-    source .venv/bin/activate
-    log_info "Устанавливаю Python-зависимости (pip install -r requirements.txt)..."
-    pip install -q -r requirements.txt
+    ensure_venv_ready
     log_ok "Python-зависимости установлены"
 
     echo ""
@@ -567,21 +719,30 @@ setup_env_interactive() {
 # ─── Step 3: Docker ──────────────────────────────────────────
 
 setup_docker() {
-    if ! command -v docker &>/dev/null || ! docker info &>/dev/null 2>&1; then
-        log_warn "Docker не доступен — пропускаю запуск контейнеров"
-        log_info "Установите Docker и запустите ./run.sh setup заново"
+    if ! command -v docker &>/dev/null; then
+        log_warn "Docker не установлен"
+        log_info "Запустите ./run.sh install и установите Docker"
         return 0
     fi
 
-    if docker compose version &>/dev/null; then
-        docker compose up -d
-    elif command -v docker-compose &>/dev/null; then
-        docker-compose up -d
+    if ! docker info &>/dev/null 2>&1; then
+        log_warn "Docker не доступен — пропускаю запуск контейнеров"
+        if [[ "$OS_KERNEL" == "Darwin" ]]; then
+            log_info "Запустите Docker Desktop: open -a Docker"
+        else
+            log_info "Попробуйте: sudo systemctl start docker"
+        fi
+        return 0
+    fi
+
+    if ! docker_compose up -d; then
+        log_err "Не удалось запустить docker compose"
+        return 1
     fi
 
     log_ok "Docker-сервисы запущены (Redis + Postgres)"
     log_info "Жду готовности..."
-    sleep 3
+    sleep 5
 }
 
 # ─── Step 4: Migrations ──────────────────────────────────────
@@ -592,7 +753,7 @@ setup_migrations() {
         return 0
     fi
 
-    cmd_migrate 2>/dev/null || {
+    cmd_migrate || {
         log_warn "Не удалось применить миграции (Postgres ещё не готов?)"
         log_info "Запустите ./run.sh migrate после старта Docker"
     }
@@ -604,9 +765,10 @@ setup_migrations() {
 
 setup_webhook_interactive() {
     # Source env vars
-    if [[ -f .env ]]; then
-        set -a; source .env 2>/dev/null; set +a
+    if [[ -z "${OS_KERNEL:-}" ]]; then
+        detect_os
     fi
+    load_env
 
     local token="${TELEGRAM_BOT_TOKEN:-}"
     if [[ -z "$token" || "$token" == "your_bot_token_here" ]]; then
@@ -639,21 +801,35 @@ setup_webhook_interactive() {
                     brew install ngrok 2>/dev/null || true
                 else
                     sudo snap install ngrok 2>/dev/null || {
-                        curl -fsSL https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz | sudo tar xz -C /usr/local/bin 2>/dev/null || true
+                        local ngrok_arch="amd64"
+                        if [[ "${OS_ARCH:-}" == "aarch64" || "${OS_ARCH:-}" == "arm64" ]]; then
+                            ngrok_arch="arm64"
+                        fi
+                        curl -fsSL "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-${ngrok_arch}.tgz" | sudo tar xz -C /usr/local/bin 2>/dev/null || true
                     }
                 fi
             fi
         fi
 
         echo ""
-        echo -e "${CYAN}Для регистрации вебхука через ngrok:${NC}"
-        echo "  1. В отдельном терминале запустите: ngrok http ${WEBHOOK_PORT:-8080}"
-        echo "  2. Скопируйте HTTPS URL (например: https://abc123.ngrok-free.app)"
-        echo ""
-        prompt_with_default "Вставьте ngrok HTTPS URL (или оставьте пустым — настроите позже)" "" NGROK_URL
+        local NGROK_URL=""
+        if prompt_yn "Запустить ngrok автоматически и взять URL?" "y"; then
+            if start_ngrok_tunnel; then
+                NGROK_URL="$NGROK_PUBLIC_URL"
+            fi
+        fi
+
+        if [[ -z "$NGROK_URL" ]]; then
+            echo -e "${CYAN}Для регистрации вебхука через ngrok:${NC}"
+            echo "  1. В отдельном терминале запустите: ngrok http ${WEBHOOK_PORT:-8080}"
+            echo "  2. Скопируйте HTTPS URL (например: https://abc123.ngrok-free.app)"
+            echo ""
+            prompt_with_default "Вставьте ngrok HTTPS URL (или оставьте пустым — настроите позже)" "" NGROK_URL
+        fi
 
         if [[ -n "$NGROK_URL" ]]; then
             webhook_url="${NGROK_URL}${WEBHOOK_PATH:-/webhook}"
+            set_env_var "WEBHOOK_MODE" "ngrok"
             set_env_var "WEBHOOK_DOMAIN" "$NGROK_URL"
         else
             log_info "Пропущено. Запустите ./run.sh webhook после старта ngrok"
@@ -892,7 +1068,54 @@ cmd_install() {
 # ============================================================
 
 cmd_webhook() {
+    detect_os
     setup_webhook_interactive
+}
+
+cmd_tunnel() {
+    local action="${1:-status}"
+    load_env
+
+    case "$action" in
+        up|start)
+            start_ngrok_tunnel
+            ;;
+        down|stop)
+            stop_ngrok_tunnel
+            ;;
+        status)
+            if [[ -f "$NGROK_PID_FILE" ]]; then
+                local pid
+                pid="$(cat "$NGROK_PID_FILE" 2>/dev/null || true)"
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    local url
+                    url="$(get_ngrok_public_url)"
+                    if [[ -n "$url" ]]; then
+                        log_ok "ngrok запущен (PID: $pid, URL: $url)"
+                    else
+                        log_warn "ngrok запущен (PID: $pid), но URL не получен"
+                    fi
+                    return 0
+                fi
+            fi
+            log_warn "ngrok не запущен через run.sh"
+            ;;
+        url)
+            local url
+            url="$(get_ngrok_public_url)"
+            if [[ -n "$url" ]]; then
+                echo "$url"
+            else
+                log_err "Не удалось получить URL. Убедитесь, что ngrok запущен"
+                return 1
+            fi
+            ;;
+        *)
+            log_err "Неизвестная команда tunnel: $action"
+            echo "Использование: ./run.sh tunnel [up|down|status|url]"
+            return 1
+            ;;
+    esac
 }
 
 # ============================================================
@@ -900,56 +1123,54 @@ cmd_webhook() {
 # ============================================================
 
 cmd_up() {
+    detect_os
     log_info "Запуск сервисов..."
 
     # Check .env
     if [[ ! -f .env ]]; then
-        log_err ".env не найден. Сначала запустите: ./run.sh setup"
-        return 1
+        log_warn ".env не найден"
+        if prompt_yn "Создать и заполнить .env сейчас?" "y"; then
+            setup_env_interactive
+        else
+            log_err "Без .env запуск невозможен"
+            return 1
+        fi
     fi
+    load_env
 
     # Start Docker services
-    if docker compose version &>/dev/null 2>&1; then
-        docker compose up -d
-    elif command -v docker-compose &>/dev/null; then
-        docker-compose up -d
-    else
-        log_err "docker compose не найден"
+    if ! command -v docker &>/dev/null; then
+        log_err "Docker не найден. Выполните ./run.sh install"
+        return 1
+    fi
+    if ! docker info &>/dev/null 2>&1; then
+        log_err "Docker установлен, но не запущен"
+        return 1
+    fi
+    if ! docker_compose up -d; then
+        log_err "docker compose не найден или не удалось запустить сервисы"
         return 1
     fi
     log_ok "Docker-сервисы запущены (Redis + Postgres)"
 
     # Wait
     log_info "Жду готовности..."
-    sleep 3
+    sleep 5
 
     # Apply local migrations
     cmd_migrate
 
     # Ensure venv + deps
-    if [[ ! -d ".venv" ]]; then
-        python3 -m venv .venv
-    fi
-    # shellcheck source=/dev/null
-    source .venv/bin/activate
-    pip install -q -r requirements.txt
+    ensure_venv_ready
 
-    # Start webhook and worker
-    log_info "Запускаю webhook сервер..."
-    python3 run_webhook.py &
-    WEBHOOK_PID=$!
-    echo "$WEBHOOK_PID" > .webhook.pid
-    log_ok "Webhook запущен (PID: $WEBHOOK_PID)"
-
-    log_info "Запускаю worker..."
-    python3 run_worker.py &
-    WORKER_PID=$!
-    echo "$WORKER_PID" > .worker.pid
-    log_ok "Worker запущен (PID: $WORKER_PID)"
+    # Start webhook and worker as managed background processes.
+    start_managed_process "webhook" ".webhook.pid" "$WEBHOOK_LOG_FILE" python3 run_webhook.py
+    start_managed_process "worker" ".worker.pid" "$WORKER_LOG_FILE" python3 run_worker.py
 
     echo ""
     log_ok "Все сервисы работают"
-    log_info "Логи: ./run.sh logs"
+    log_info "Логи приложения: ./run.sh logs app"
+    log_info "Логи Docker: ./run.sh logs docker"
     log_info "Остановить: ./run.sh down"
 }
 
@@ -960,21 +1181,14 @@ cmd_up() {
 cmd_down() {
     log_info "Останавливаю сервисы..."
 
-    for pidfile in .webhook.pid .worker.pid; do
-        if [[ -f "$pidfile" ]]; then
-            pid=$(cat "$pidfile")
-            if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid"
-                log_ok "Остановлен процесс $pid"
-            fi
-            rm -f "$pidfile"
-        fi
-    done
+    stop_pidfile_process ".webhook.pid" "webhook"
+    stop_pidfile_process ".worker.pid" "worker"
+    stop_ngrok_tunnel
 
-    if docker compose version &>/dev/null 2>&1; then
-        docker compose down
-    elif command -v docker-compose &>/dev/null; then
-        docker-compose down
+    if docker_compose down; then
+        log_ok "Docker-сервисы остановлены"
+    else
+        log_warn "docker compose недоступен — пропускаю остановку контейнеров"
     fi
     log_ok "Сервисы остановлены"
 }
@@ -984,12 +1198,32 @@ cmd_down() {
 # ============================================================
 
 cmd_logs() {
-    echo "Логи Docker (Ctrl+C для выхода)..."
-    if docker compose version &>/dev/null 2>&1; then
-        docker compose logs -f --tail=50
-    elif command -v docker-compose &>/dev/null; then
-        docker-compose logs -f --tail=50
-    fi
+    local mode="${1:-app}"
+
+    case "$mode" in
+        app)
+            mkdir -p "$APP_LOG_DIR"
+            touch "$WEBHOOK_LOG_FILE" "$WORKER_LOG_FILE" "$NGROK_LOG_FILE"
+            echo "Логи приложения (Ctrl+C для выхода)..."
+            echo "  - $WEBHOOK_LOG_FILE"
+            echo "  - $WORKER_LOG_FILE"
+            echo "  - $NGROK_LOG_FILE"
+            tail -n 50 -f "$WEBHOOK_LOG_FILE" "$WORKER_LOG_FILE" "$NGROK_LOG_FILE"
+            ;;
+        docker)
+            echo "Логи Docker (Ctrl+C для выхода)..."
+            docker_compose logs -f --tail=50
+            ;;
+        all)
+            echo "Сначала покажу логи приложения, затем можно открыть Docker логи отдельной командой."
+            cmd_logs app
+            ;;
+        *)
+            log_err "Неизвестный режим логов: $mode"
+            echo "Использование: ./run.sh logs [app|docker|all]"
+            return 1
+            ;;
+    esac
 }
 
 # ============================================================
@@ -997,11 +1231,24 @@ cmd_logs() {
 # ============================================================
 
 cmd_migrate() {
+    detect_os
     log_info "Применяю миграции локального Postgres..."
 
-    if [[ -f .env ]]; then
-        set -a; source .env 2>/dev/null; set +a
+    if ! command -v psql &>/dev/null; then
+        log_warn "psql не найден"
+        if prompt_yn "Установить PostgreSQL client сейчас?" "y"; then
+            if [[ "$OS_KERNEL" == "Darwin" ]]; then
+                install_package libpq "PostgreSQL client" || true
+            else
+                install_package postgresql-client "PostgreSQL client" || true
+            fi
+        fi
     fi
+    if ! command -v psql &>/dev/null; then
+        log_err "psql по-прежнему не найден, миграции не выполнены"
+        return 1
+    fi
+    load_env
 
     local PG_HOST="${POSTGRES_HOST:-localhost}"
     local PG_PORT="${POSTGRES_PORT:-5432}"
@@ -1011,22 +1258,32 @@ cmd_migrate() {
     export PGPASSWORD="${POSTGRES_PASSWORD:-change_me_in_production}"
 
     # Wait for Postgres
-    local retries=10
+    local retries=30
     while ! psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -c "SELECT 1" &>/dev/null; do
         ((retries--))
         if [[ $retries -le 0 ]]; then
             log_err "Postgres не доступен: $PG_HOST:$PG_PORT"
+            unset PGPASSWORD
             return 1
         fi
         sleep 1
     done
 
-    for migration in migrations/002_*.sql migrations/003_*.sql migrations/004_*.sql migrations/005_*.sql; do
-        if [[ -f "$migration" ]]; then
-            log_info "Применяю: $migration"
-            psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -f "$migration" 2>&1 | grep -v "^NOTICE" || true
-            log_ok "$(basename "$migration")"
+    mapfile -t migrations_to_apply < <(ls migrations/00[2-5]_*.sql 2>/dev/null | sort)
+    if [[ "${#migrations_to_apply[@]}" -eq 0 ]]; then
+        log_warn "Локальные миграции не найдены (ожидались migrations/002..005_*.sql)"
+        unset PGPASSWORD
+        return 0
+    fi
+
+    for migration in "${migrations_to_apply[@]}"; do
+        log_info "Применяю: $migration"
+        if ! psql -v ON_ERROR_STOP=1 -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d "$PG_DB" -f "$migration"; then
+            log_err "Ошибка в миграции: $migration"
+            unset PGPASSWORD
+            return 1
         fi
+        log_ok "$(basename "$migration")"
     done
 
     unset PGPASSWORD
@@ -1039,6 +1296,7 @@ cmd_migrate() {
 
 cmd_test() {
     local test_type="${1:-unit}"
+    load_env
 
     if [[ -d ".venv" ]]; then
         # shellcheck source=/dev/null
@@ -1108,7 +1366,8 @@ case "$cmd" in
     up)      cmd_up ;;
     down)    cmd_down ;;
     webhook) cmd_webhook ;;
-    logs)    cmd_logs ;;
+    tunnel)  cmd_tunnel "${2:-status}" ;;
+    logs)    cmd_logs "${2:-app}" ;;
     migrate) cmd_migrate ;;
     test)    cmd_test "${2:-unit}" ;;
     seed)    cmd_seed ;;
@@ -1124,7 +1383,8 @@ case "$cmd" in
         echo -e "${BOLD}Управление:${NC}"
         echo "  up         Запустить все сервисы"
         echo "  down       Остановить все сервисы"
-        echo "  logs       Логи Docker-контейнеров"
+        echo "  tunnel     Управление ngrok [up|down|status|url]"
+        echo "  logs       Логи [app|docker|all]"
         echo ""
         echo -e "${BOLD}Настройка:${NC}"
         echo "  env        Показать / изменить .env"

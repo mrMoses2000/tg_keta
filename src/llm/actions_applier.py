@@ -18,6 +18,7 @@ import structlog
 from src.models import ActionsJson, UserProfile, ConversationState
 from src.db import supabase_client as supa
 from src.db import postgres as pg
+from src.engine import fsm
 
 logger = structlog.get_logger(__name__)
 
@@ -48,6 +49,14 @@ async def apply_actions(
     if actions.state_patch:
         new_mode = actions.state_patch.mode or state.mode
         new_step = actions.state_patch.step
+
+        if not fsm.is_valid_transition(state.mode, new_mode):
+            logger.warning(
+                "actions_state_patch_invalid_transition",
+                current_mode=state.mode,
+                requested_mode=new_mode,
+            )
+            new_mode = state.mode
 
         await pg.upsert_conversation_state(
             user_id=profile.id,

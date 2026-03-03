@@ -65,18 +65,26 @@ async def check_processed_update(update_id: int) -> bool:
     return row is not None
 
 
-async def mark_update_received(update_id: int, worker_id: str = "webhook") -> None:
-    """Insert into processed_updates with status='received'."""
+async def mark_update_received(update_id: int, worker_id: str = "webhook") -> bool:
+    """
+    Atomically mark update as received.
+
+    Returns:
+      True  - update_id was inserted (first time seen)
+      False - update_id already exists (duplicate webhook delivery)
+    """
     pool = await get_pool()
-    await pool.execute(
+    row = await pool.fetchval(
         """
         INSERT INTO processed_updates (telegram_update_id, status, worker_id)
         VALUES ($1, 'received', $2)
         ON CONFLICT (telegram_update_id) DO NOTHING
+        RETURNING telegram_update_id
         """,
         update_id,
         worker_id,
     )
+    return row is not None
 
 
 async def insert_inbound_event(

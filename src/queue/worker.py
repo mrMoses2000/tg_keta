@@ -67,6 +67,7 @@ HELP_TEXT = (
 )
 
 PLACEHOLDER_TEXT = "Подбираю для вас... 🔍"
+MAX_LOCK_REQUEUE_ATTEMPTS = 5
 
 
 async def process_job(job_data: dict) -> None:
@@ -81,10 +82,26 @@ async def process_job(job_data: dict) -> None:
     # ── Acquire per-user lock ──
     lock_acquired = await rc.acquire_user_lock(job.user_id, ttl=120)
     if not lock_acquired:
-        # Re-enqueue with delay (another worker is processing this user)
-        log.info("worker_user_locked_requeue")
-        await asyncio.sleep(1)
-        await rc.enqueue_job(job_data)
+        # Re-enqueue with bounded retries to avoid infinite queue loops.
+        next_attempt = job.attempt + 1
+        if next_attempt > MAX_LOCK_REQUEUE_ATTEMPTS:
+            log.warning(
+                "worker_user_locked_drop",
+                attempt=next_attempt,
+                max_attempts=MAX_LOCK_REQUEUE_ATTEMPTS,
+            )
+            await pg.mark_update_failed(job.update_id)
+            return
+
+        log.info(
+            "worker_user_locked_requeue",
+            attempt=next_attempt,
+            max_attempts=MAX_LOCK_REQUEUE_ATTEMPTS,
+        )
+        await asyncio.sleep(min(next_attempt, 5))
+        await rc.enqueue_job(
+            job.model_copy(update={"attempt": next_attempt}).model_dump(mode="json")
+        )
         return
 
     try:

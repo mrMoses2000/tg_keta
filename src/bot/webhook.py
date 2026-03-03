@@ -82,14 +82,13 @@ async def handle_webhook(request: web.Request) -> web.Response:
 
     log = logger.bind(update_id=update.update_id, chat_id=chat_id, user_id=user_id)
 
-    # ── Step 3: Idempotency check ──
-    is_duplicate = await pg.check_processed_update(update.update_id)
-    if is_duplicate:
+    # ── Step 3: Atomic idempotency mark ──
+    first_seen = await pg.mark_update_received(update.update_id)
+    if not first_seen:
         log.debug("webhook_duplicate_update")
         return web.json_response({"ok": True})
 
-    # ── Step 4: Audit + mark received ──
-    await pg.mark_update_received(update.update_id)
+    # ── Step 4: Audit ──
     inbound_id = await pg.insert_inbound_event(
         update_id=update.update_id,
         chat_id=chat_id,
