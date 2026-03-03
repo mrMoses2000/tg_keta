@@ -191,11 +191,12 @@ def create_user(
     response = (
         client.table("users")
         .insert(payload)
-        .select("*")
         .execute()
     )
 
     # Some environments can return minimal/empty response to insert; handle safely.
+    # We intentionally do a second lookup by telegram_id instead of chaining .select()
+    # because older/newer postgrest builder variants may not support insert().select().
     if response is not None and response.data:
         row = response.data[0] if isinstance(response.data, list) else response.data
         return _parse_user(row)
