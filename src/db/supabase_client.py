@@ -164,6 +164,9 @@ def get_user_by_telegram_id(tg_id: int) -> UserProfile | None:
         .maybe_single()
         .execute()
     )
+    if response is None:
+        logger.error("supabase_empty_response", operation="get_user_by_telegram_id", telegram_id=tg_id)
+        return None
     if response.data:
         return _parse_user(response.data)
     return None
@@ -178,20 +181,34 @@ def create_user(
 ) -> UserProfile:
     """Create a new user record from Telegram data."""
     client = get_client()
+    payload = {
+        "telegram_id": tg_id,
+        "telegram_first_name": first_name,
+        "telegram_last_name": last_name,
+        "telegram_username": username,
+        "language_code": language_code,
+    }
     response = (
         client.table("users")
-        .insert(
-            {
-                "telegram_id": tg_id,
-                "telegram_first_name": first_name,
-                "telegram_last_name": last_name,
-                "telegram_username": username,
-                "language_code": language_code,
-            }
-        )
+        .insert(payload)
+        .select("*")
         .execute()
     )
-    return _parse_user(response.data[0])
+
+    # Some environments can return minimal/empty response to insert; handle safely.
+    if response is not None and response.data:
+        row = response.data[0] if isinstance(response.data, list) else response.data
+        return _parse_user(row)
+
+    logger.warning("supabase_create_user_empty_response", telegram_id=tg_id)
+    existing = get_user_by_telegram_id(tg_id)
+    if existing is not None:
+        return existing
+
+    raise RuntimeError(
+        "Supabase users insert returned empty response. "
+        "Проверьте SUPABASE_SERVICE_ROLE_KEY, RLS и схему таблицы users."
+    )
 
 
 def update_user_profile(user_id: str, patch: dict) -> None:

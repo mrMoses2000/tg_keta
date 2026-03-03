@@ -12,18 +12,24 @@ from src.db import supabase_client as supa
 class _FakeQuery:
     def __init__(self):
         self.update_payload: dict | None = None
+        self.insert_payload: dict | None = None
         self.eq_field: str | None = None
         self.eq_value: str | None = None
         self.text_search_calls: list[tuple[str, str, dict]] = []
         self.ilike_calls: list[tuple[str, str]] = []
         self.order_calls: list[tuple[str, bool]] = []
         self.limit_calls: list[int] = []
+        self._response_data = []
 
     def update(self, payload: dict):
         self.update_payload = payload
         return self
 
     def select(self, *_args, **_kwargs):
+        return self
+
+    def insert(self, payload: dict):
+        self.insert_payload = payload
         return self
 
     def eq(self, field: str, value: str):
@@ -48,7 +54,7 @@ class _FakeQuery:
         return self
 
     def execute(self):
-        return type("Resp", (), {"data": []})()
+        return type("Resp", (), {"data": self._response_data})()
 
 
 class _FakeClient:
@@ -99,3 +105,38 @@ def test_search_recipes_uses_text_search_options_dict(monkeypatch):
     assert column == "title"
     assert query == "кето суп"
     assert options == {"config": "russian"}
+
+
+def test_create_user_returns_inserted_row(monkeypatch):
+    fake_client = _FakeClient()
+    fake_client.query._response_data = [
+        {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "telegram_id": 777,
+            "telegram_first_name": "Ivan",
+            "language_code": "ru",
+        }
+    ]
+    monkeypatch.setattr(supa, "get_client", lambda: fake_client)
+
+    profile = supa.create_user(tg_id=777, first_name="Ivan")
+
+    assert fake_client.table_name == "users"
+    assert fake_client.query.insert_payload is not None
+    assert fake_client.query.insert_payload["telegram_id"] == 777
+    assert profile.telegram_id == 777
+
+
+def test_create_user_fallbacks_to_existing_on_empty_insert_response(monkeypatch):
+    fake_client = _FakeClient()
+    fake_client.query._response_data = None
+    monkeypatch.setattr(supa, "get_client", lambda: fake_client)
+    monkeypatch.setattr(
+        supa,
+        "get_user_by_telegram_id",
+        lambda tg_id: supa.UserProfile(id="x", telegram_id=tg_id, telegram_first_name="Recovered"),
+    )
+
+    profile = supa.create_user(tg_id=888)
+
+    assert profile.telegram_id == 888
